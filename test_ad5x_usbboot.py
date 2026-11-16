@@ -10,6 +10,7 @@ image. A real image can be checked too: KILN_SPL_USB=path/to/spl-usb.bin.
 
   python3 -m unittest -v
 """
+import importlib.util
 import array
 import hashlib
 import os
@@ -341,7 +342,7 @@ class TestRefusals(unittest.TestCase):
         self.assertEqual(r.rc, ub.EXIT_ERROR)
         self.assertEqual(r.dev.calls, [])
 
-    @unittest.skipIf(__import__("importlib").util.find_spec("usb"),
+    @unittest.skipIf(importlib.util.find_spec("usb"),
                      "pyusb is installed here")
     def test_no_pyusb(self):
         out, err = [], []
