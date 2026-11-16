@@ -123,7 +123,7 @@ class TestRequests(unittest.TestCase):
     def expected(self, flush=True, n=None):
         n = len(self.img) if n is None else n
         calls = [
-            ("ctrl", 0xC0, 0x00, 0, 0, 8, 1000),
+            ("ctrl", 0xC0, 0x00, 0, 0, 5, 1000),
             ("ctrl", 0x40, 0x01, 0x8000, 0x1000, None, 1000),
             ("ctrl", 0x40, 0x02, n >> 16, n & 0xFFFF, None, 1000),
             ("write", 0x01, self.img, 10000),
@@ -150,10 +150,10 @@ class TestRequests(unittest.TestCase):
 
     def test_timeouts_and_cpu_info_length(self):
         r = Run(["--timeout", "250", "--bulk-timeout", "3000",
-                 "--cpu-info-length", "5", "run-spl", self.path])
+                 "--cpu-info-length", "8", "run-spl", self.path])
         self.assertEqual(r.rc, 0, r.err)
         c = r.dev.calls
-        self.assertEqual(c[0], ("ctrl", 0xC0, 0, 0, 0, 5, 250))
+        self.assertEqual(c[0], ("ctrl", 0xC0, 0, 0, 0, 8, 250))
         self.assertEqual(c[3][3], 3000)
         self.assertTrue(all(x[-1] == 250 for x in c if x[0] == "ctrl"))
 
@@ -165,10 +165,30 @@ class TestRequests(unittest.TestCase):
     def test_info(self):
         r = Run(["info"])
         self.assertEqual(r.rc, 0, r.err)
-        self.assertEqual(r.dev.calls, [("ctrl", 0xC0, 0, 0, 0, 8, 1000)])
+        self.assertEqual(r.dev.calls, [("ctrl", 0xC0, 0, 0, 0, 5, 1000)])
         self.assertTrue(r.out[0].startswith("device a108:eaef on bus 3 "
                                             "address 7, high speed"))
         self.assertIn("GET_CPU_INFO: 'X2600' (5 bytes: 5832363030)", r.out)
+
+    def test_speed_from_packets_when_unknown(self):
+        # pyusb on Windows leaves dev.speed empty (alexshev86, #68)
+        class Ep:
+            bEndpointAddress, bmAttributes, wMaxPacketSize = 0x01, 2, 512
+
+        class Intf(list):
+            bInterfaceClass, bNumEndpoints = 0xFF, 1
+
+        class Cfg:
+            def __getitem__(self, key):
+                return Intf([Ep()])
+
+        dev = FakeDevice()
+        dev.speed = None
+        dev.get_active_configuration = lambda: Cfg()
+        self.assertIn("high (from the 512-byte packets) speed",
+                      ub.describe_device(dev).splitlines()[0])
+        dev.get_active_configuration = FakeDevice.get_active_configuration.__get__(dev)
+        self.assertIn("unknown speed", ub.describe_device(dev).splitlines()[0])
 
     def test_start1_unanswered(self):
         r = Run(["run-spl", self.path],
@@ -244,7 +264,7 @@ class TestDryRun(unittest.TestCase):
         self.assertEqual(r.out, [
             "dry run: nothing is sent; the transfers, in order:",
             "GET_CPU_INFO  ctrl IN  bmRequestType=0xc0 bRequest=0x00 "
-            "wValue=0x0000 wIndex=0x0000 wLength=8 timeout=1000ms",
+            "wValue=0x0000 wIndex=0x0000 wLength=5 timeout=1000ms",
             "SET_DATA_ADDR ctrl OUT bmRequestType=0x40 bRequest=0x01 "
             "wValue=0x8000 wIndex=0x1000 wLength=0 timeout=1000ms "
             "(address 0x80001000)",

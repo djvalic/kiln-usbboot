@@ -1,10 +1,12 @@
 # kiln-usbboot
 
-**Status: not yet tested on real hardware.** The protocol was
-cross-checked against Ingenic's GPL SDK source, Rockbox's jztool and
-ballaswag/ingenic-usbboot, and the tests run against a fake USB device.
-The first runs on a printer are still to come; until then, expect that
-something may need changing.
+**Status: partly tested on real hardware.** `info` has run against an
+AD5X's boot ROM (alexshev86, Windows 10, djvalic/kiln-os#68): the
+descriptors are as expected and GET_CPU_INFO answers `X2600`. `run-spl`
+has not run on a printer yet. The protocol was cross-checked against
+Ingenic's GPL SDK source, Rockbox's jztool and ballaswag/ingenic-usbboot,
+and the tests run against a fake USB device; until `run-spl` has run on a
+printer, expect that something may need changing.
 
 An open loader for the USB mode of the Ingenic X2600 boot ROM. I made it
 for the Flashforge AD5X and [Kiln OS](https://github.com/djvalic/kiln-os):
@@ -45,6 +47,16 @@ the eMMC.
 
   libusb-1.0 comes from your distribution (`libusb` on Arch,
   `libusb-1.0-0` on Debian and Ubuntu).
+- On Windows (tested by alexshev86 on Windows 10, djvalic/kiln-os#68): in a
+  venv, `pip install pyusb libusb-package`, then copy the `libusb-1.0.dll`
+  from the `libusb_package` folder next to the venv's `python.exe` so
+  pyusb finds a backend. It opened the boot ROM through the libusb-win32
+  driver USBCloner had already installed, with no driver change, and
+  USBCloner still worked afterwards. Two things look different there:
+  pyusb doesn't report the speed, so `info` works it out from the
+  512-byte packets, and every device shows as bus 0 address 1, so
+  `--bus`/`--address` can't pick one of two attached boot ROMs (attach
+  only one).
 - Access to the boot ROM device, `a108:eaef`. Either run as root or add a
   udev rule, e.g. `/etc/udev/rules.d/70-ingenic-usbboot.rules`:
 
@@ -75,7 +87,7 @@ python3 ad5x_usbboot.py --dry-run run-spl spl-usb.bin
   length, timeout, and the image's SHA-256) and sends nothing. It needs
   neither pyusb nor a device.
 - `--timeout MS` (control transfers, default 1000), `--bulk-timeout MS`
-  (default 10000), `--cpu-info-length N` (default 8), and `--bus` and
+  (default 10000), `--cpu-info-length N` (default 5, what the X2600 answers), and `--bus` and
   `--address` to pick one device when more than one is attached.
 
 Exit codes:

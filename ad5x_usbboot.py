@@ -33,9 +33,10 @@ The protocol, as the sources below agree:
   endpoints 0x01 OUT and 0x81 IN, 512-byte packets at high speed (Rockbox
   utils/jztool/src/device_info.c, X1600 entry, seen on hardware).
 * Vendor requests on EP0 to the device, recipient device:
-    0x00 GET_CPU_INFO   IN  (bmRequestType 0xC0), wLength 8: an ID
-                        string; the X1600 answers 5 bytes, Cloner's X2600
-                        configs read 5 (cpu_info_length=5)
+    0x00 GET_CPU_INFO   IN  (bmRequestType 0xC0), wLength 5: an ID
+                        string; the X2600 answers 'X2600', 5 bytes, no NUL
+                        (seen on an AD5X, djvalic/kiln-os#68), as the X1600
+                        and Cloner's X2600 configs (cpu_info_length=5)
     0x01 SET_DATA_ADDR  OUT (0x40), no data: wValue = address bits 31:16,
                         wIndex = bits 15:0; the address must be 4-aligned
     0x02 SET_DATA_LEN   OUT (0x40), the length split the same way
@@ -105,7 +106,7 @@ RT_VENDOR_IN = 0xC0
 EP_BULK_OUT = 0x01
 EP_BULK_IN = 0x81
 
-CPU_INFO_LEN = 8
+CPU_INFO_LEN = 5          # the X2600 answers 'X2600', 5 bytes, no NUL (alexshev86, #68)
 CTRL_TIMEOUT_MS = 1000     # Rockbox jztool, ballaswag
 BULK_TIMEOUT_MS = 10000
 
@@ -353,9 +354,11 @@ def open_device(bus=None, address=None):
             (VID, PID))
     if len(devs) > 1:
         raise UsbBootError("%d boot ROM devices: pick one with --bus and "
-                           "--address (%s)" % (len(devs), ", ".join(
-                               "bus %d address %d" % (d.bus, d.address)
-                               for d in devs)))
+                           "--address (%s; on Windows these numbers don't "
+                           "tell devices apart: attach only one)" % (
+                               len(devs), ", ".join(
+                                   "bus %d address %d" % (d.bus, d.address)
+                                   for d in devs)))
     dev = devs[0]
     try:
         try:
@@ -392,10 +395,19 @@ def close_device(dev):
 def describe_device(dev):
     """Bus, speed, strings and endpoints, as far as they can be read."""
     speeds = {1: "low", 2: "full", 3: "high", 4: "super"}
+    speed = speeds.get(getattr(dev, "speed", None))
+    if speed is None:
+        # pyusb on Windows leaves dev.speed empty for this device; 512-byte
+        # bulk packets only exist at high speed (or faster)
+        try:
+            intf = dev.get_active_configuration()[(0, 0)]
+            if any(ep.wMaxPacketSize >= 512 for ep in intf):
+                speed = "high (from the 512-byte packets)"
+        except Exception:
+            pass
     lines = ["device %04x:%04x on bus %s address %s, %s speed" %
              (dev.idVendor, dev.idProduct, getattr(dev, "bus", "?"),
-              getattr(dev, "address", "?"),
-              speeds.get(getattr(dev, "speed", None), "unknown"))]
+              getattr(dev, "address", "?"), speed or "unknown")]
     for attr in ("manufacturer", "product", "serial_number"):
         try:
             v = getattr(dev, attr)
