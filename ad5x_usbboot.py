@@ -6,14 +6,21 @@ An open loader for the boot ROM's USB mode, made for the Flashforge AD5X
 and Kiln OS (https://github.com/djvalic/kiln-os): the ROM loads stage 1
 into its SRAM window and runs it; nothing is written to the eMMC. With
 Kiln's spl-usb.bin, the SPL then boots the flagged slot from the eMMC,
-read-only, as it would from an eMMC start. README.md has the wiring and
-how to get the printer into USB mode.
+read-only, as it would from an eMMC start. With Kiln's spl-usb2.bin and
+u-boot.bin, the SPL only sets up DDR and the ROM then runs Kiln's U-Boot
+from DDR, which offers the whole eMMC to the host as a USB disk. README.md
+has the wiring and how to get the printer into USB mode.
 
   ad5x_usbboot.py info
       GET_CPU_INFO, and the device's descriptors
   ad5x_usbboot.py run-spl spl-usb.bin
       GET_CPU_INFO, SET_DATA_ADDR 0x80001000, SET_DATA_LEN, the image on
       bulk OUT, FLUSH_CACHE, PROG_START1 0x80001800
+  ad5x_usbboot.py run-uboot spl-usb2.bin u-boot.bin
+      stage 1 as run-spl, but PROG_START1's status stage waits (up to 20 s)
+      for the SPL to come back to the ROM; then SET_DATA_ADDR 0x80100000,
+      SET_DATA_LEN, u-boot.bin on bulk OUT, FLUSH_CACHE, PROG_START2
+      0x80100000
   --dry-run   print the exact transfers instead (no USB, no pyusb needed)
 
 The image: any X2600 stage-1 image laid out from 0x80001000, i.e. a 2 KiB
@@ -43,8 +50,9 @@ The protocol, as the sources below agree:
     0x03 FLUSH_CACHE    OUT (0x40), wValue = wIndex = 0
     0x04 PROG_START1    OUT (0x40), the entry point split as above: run
                         stage 1 (in SRAM; Ingenic's own stage 1 returns to
-                        the ROM, Kiln's SPL doesn't: it boots the slot)
-    0x05 PROG_START2    OUT (0x40), the same for stage 2 in DDR (unused)
+                        the ROM, Kiln's spl-usb.bin doesn't: it boots the
+                        slot; spl-usb2.bin does, see run-uboot below)
+    0x05 PROG_START2    OUT (0x40), the same for stage 2 in DDR (run-uboot)
   then the data of SET_DATA_ADDR/SET_DATA_LEN on bulk OUT 0x01.
   Sources: Ingenic's GPL device side, SDK u-boot common/spl/usb_boot.c
   handle_setup_packet() (address = (word1 & 0xffff0000) | (word2 &
@@ -80,8 +88,43 @@ before the upload. The X2600's window is KSEG0 (cached), so this tool
 follows Ingenic's order; --no-flush leaves FLUSH_CACHE out. Which one the
 X2600 ROM needs is for hardware to show.
 
+run-uboot, stage 1 then stage 2 (Kiln OS, jolting's djvalic/kiln-os#75;
+Kiln's U-Boot patch 0034, "U-Boot proper over USB as stage 2"):
+
+* spl-usb2.bin is Kiln's spl-mmc.img with "KILNUSB2" at 0x7F0 instead of
+  spl-usb.bin's "KILNUSB1" (ad5x_spl_image.py usb-image --stage2). Kiln's
+  SPL saves what the ROM handed over (ra, sp, gp, s0-s7, fp, CP0 Status
+  and Cause) first thing in _start; with KILNUSB2 it sets up the clocks,
+  DDR (with its DDR test) and the eMMC as for a start over USB (the MSC
+  pads at 1.8 V), stops the watchdog, leaves 0x5a2b in CPSPR, flushes its
+  cache and returns to the ROM with those registers and v0 = 0 ("stage 1
+  done"), as Ingenic's own stage 1 and the stock SPL do in USB mode.
+* The ROM answers PROG_START1's status stage only then: after the DDR
+  setup and test, a few seconds. This tool gives that control transfer
+  20 s (STAGE1_RETURN_MS) instead of the 1 s of the others; when it times
+  out, the SPL didn't come back and nothing more is sent.
+* The ROM, back in its USB loop on the same device (no new enumeration),
+  then takes stage 2 as Ingenic's usb_load.c sends it: SET_DATA_ADDR,
+  SET_DATA_LEN, the data on bulk OUT, FLUSH_CACHE, PROG_START2 with the
+  entry. Stage 2 is U-Boot proper's raw u-boot.bin, linked and started at
+  0x80100000 (CONFIG_TEXT_BASE; build.sh's mkimage -a/-e for the eMMC
+  copy). This tool waits 0.2 s after stage 1's return before it sends,
+  as Kiln's tool does.
+* Kiln's U-Boot sees 0x5a2b in CPSPR, clears it, keeps the watchdog off,
+  takes its build's default environment in RAM only and runs "ums 0 mmc
+  0": the host sees the eMMC as a USB disk (1d6b:0104, "Kiln OS"). The
+  start writes nothing to the eMMC; what the host then writes to the disk
+  is up to the host. Ctrl-C on the console ends ums.
+
+The tool refuses, before any transfer: an SPL without KILNUSB2 for
+run-uboot (spl-usb.bin or spl-mmc.img would boot the eMMC, and stage 2
+would have nobody to take it), spl-usb2.bin for run-spl (it would go back
+to the ROM and wait for a stage 2 that never comes), and as stage 2 a
+uImage (u-boot-emmc.img, u-boot-kernel-slot.img: a 64-byte mkimage header
+in front, so 0x80100000 isn't the code) or an SPL image.
+
 Nothing here writes to a disk or the printer's eMMC: only the boot ROM's
-SRAM, over USB, and only on run-spl.
+SRAM and DDR, over USB, and only on run-spl and run-uboot.
 """
 import argparse
 import hashlib
@@ -123,6 +166,13 @@ PARAMS_ID = b"INGE"
 USB_TAG_OFF = 0x7F0
 USB_TAG = b"KILNUSB1"
 CHAINLOAD_MARKER = b"KILN-SPL-CHAINLOAD-TEST-ONLY"
+# run-uboot: the SPL sets up DDR and goes back to the boot ROM, which then
+# takes U-Boot proper as stage 2 (Kiln's patch 0034)
+USB_TAG_STAGE2 = b"KILNUSB2"
+UBOOT_ADDR = 0x80100000       # U-Boot proper's CONFIG_TEXT_BASE
+STAGE1_RETURN_MS = 20000      # PROG_START1 until the SPL is back in the ROM
+STAGE2_PAUSE_S = 0.2          # after that, before stage 2 (as Kiln's tool)
+UIMAGE_MAGIC = b"\x27\x05\x19\x56"
 
 EXIT_OK, EXIT_ERROR, EXIT_START_UNCONFIRMED = 0, 1, 3
 
@@ -144,9 +194,10 @@ def split(value):
 
 # ---- the image ----
 
-def check_image(img):
+def check_image(img, stage2=False):
     """An X2600 stage-1 image: a list of notes; UsbBootError when it
-    can't be sent."""
+    can't be sent. stage2: for run-uboot, where only Kiln's spl-usb2.bin
+    (tagged KILNUSB2) will do."""
     n = len(img)
     if n < HEADER_SIZE + 4:
         raise UsbBootError("%d bytes: not a stage-1 image (a 2 KiB "
@@ -159,6 +210,10 @@ def check_image(img):
         raise UsbBootError("Kiln's chainload-test SPL can't start from the "
                            "boot ROM")
     notes = []
+    if stage2 and img[0:4] != SPL_MAGIC:
+        raise UsbBootError("no Ingenic SPL header (LPSM): run-uboot needs "
+                           "Kiln's spl-usb2.bin, which goes back to the boot "
+                           "ROM for stage 2")
     if img[0:4] != SPL_MAGIC:
         notes.append("no Ingenic SPL header (LPSM): sent as a raw stage-1 "
                      "image, its code must start at offset 0x%x (0x%08x)" %
@@ -177,6 +232,24 @@ def check_image(img):
         raise UsbBootError("the params length 0x%x isn't the image's 0x%x" %
                            (length, n))
     tag = img[USB_TAG_OFF:USB_TAG_OFF + len(USB_TAG)]
+    if stage2 and tag != USB_TAG_STAGE2:
+        # without it the SPL boots the eMMC instead of going back to the
+        # boot ROM, and the stage 2 that follows has nobody to take it
+        raise UsbBootError("no %s tag at 0x%x: run-uboot needs spl-usb2.bin "
+                           "(ad5x_spl_image.py usb-image --stage2 in the Kiln "
+                           "OS tree), not %s" % (
+                               USB_TAG_STAGE2.decode(), USB_TAG_OFF,
+                               "spl-usb.bin" if tag == USB_TAG
+                               else "spl-mmc.img or another SPL"))
+    if stage2:
+        return notes
+    if tag == USB_TAG_STAGE2:
+        # it would set up DDR and wait in the ROM for a stage 2
+        raise UsbBootError("this is spl-usb2.bin (%s at 0x%x): it sets up "
+                           "DDR and goes back to the boot ROM for stage 2; "
+                           "use run-uboot with u-boot.bin, or spl-usb.bin "
+                           "for run-spl" % (USB_TAG_STAGE2.decode(),
+                                            USB_TAG_OFF))
     if tag != USB_TAG:
         notes.append("no %s tag at 0x%x: fine for other SPLs; if this is "
                      "Kiln's spl-mmc.img, its SPL will count the scratch "
@@ -184,6 +257,22 @@ def check_image(img):
                      "start (spl-usb.bin is the one for USB)" %
                      (USB_TAG.decode(), USB_TAG_OFF))
     return notes
+
+
+def check_uboot(data):
+    """U-Boot proper for run-uboot: the raw u-boot.bin, its code from the
+    first byte (it runs at 0x80100000). UsbBootError when it can't be
+    sent."""
+    if len(data) < 4:
+        raise UsbBootError("%d bytes: not a u-boot.bin" % len(data))
+    if data[0:4] == UIMAGE_MAGIC:
+        raise UsbBootError("a uImage (mkimage header; u-boot-emmc.img or "
+                           "u-boot-kernel-slot.img): run-uboot needs the raw "
+                           "u-boot.bin, whose code starts at 0x%08x" %
+                           UBOOT_ADDR)
+    if data[0:4] == SPL_MAGIC:
+        raise UsbBootError("an SPL image (LPSM), not U-Boot proper: the "
+                           "second file is u-boot.bin")
 
 
 # ---- transports: pyusb, or printing the transfers ----
@@ -249,6 +338,8 @@ class UsbTransport:
 class DryRunTransport:
     """Prints each transfer; nothing is sent."""
 
+    dry_run = True
+
     def __init__(self, out):
         self.out = out
 
@@ -311,6 +402,55 @@ def run_spl(t, img, flush=True, timeout=CTRL_TIMEOUT_MS,
     if flush:
         flush_cache(t, timeout)
     prog_start1(t, ENTRY_ADDR, timeout)
+    return info
+
+
+def prog_start2(t, entry, timeout=CTRL_TIMEOUT_MS):
+    v, i = split(entry)
+    try:
+        t.ctrl_out(PROG_START2, v, i, timeout, " (entry 0x%08x)" % entry)
+    except UsbBootError as e:
+        raise StartUnconfirmed(
+            "%s. U-Boot went out; the boot ROM may have jumped before the "
+            "status stage: watch the serial console" % e)
+
+
+def run_uboot(t, spl_img, uboot, timeout=CTRL_TIMEOUT_MS,
+              bulk_timeout=BULK_TIMEOUT_MS, cpu_info_len=CPU_INFO_LEN,
+              stage1_timeout=STAGE1_RETURN_MS, out=print, sleep=None):
+    """Stage 1 (the SPL tagged KILNUSB2: DDR, then back to the ROM), then
+    U-Boot proper into DDR as stage 2. Returns the CPU info bytes."""
+    if sleep is None:
+        import time
+        sleep = time.sleep
+    dry = getattr(t, "dry_run", False)
+    for note in check_image(spl_img, stage2=True):
+        out("note: " + note)
+    check_uboot(uboot)
+    info = get_cpu_info(t, cpu_info_len, timeout)
+    if info:
+        out("boot ROM: %s" % format_cpu_info(info))
+    send(t, LOAD_ADDR, spl_img, timeout, bulk_timeout)
+    flush_cache(t, timeout)
+    # the status stage comes back once the SPL returns to the ROM (DDR set
+    # up and tested: a few seconds)
+    v, i = split(ENTRY_ADDR)
+    try:
+        t.ctrl_out(PROG_START1, v, i, stage1_timeout,
+                   " (entry 0x%08x; stage 1 returns)" % ENTRY_ADDR)
+    except UsbBootError as e:
+        raise UsbBootError(
+            "%s. The SPL didn't come back to the boot ROM within %d ms, so "
+            "U-Boot wasn't sent: the console shows how far it got (\"SPL: "
+            "DDR up; back to the boot ROM for stage 2 over USB\" when it "
+            "did). Get the printer into USB mode again before another try" %
+            (e, stage1_timeout))
+    if not dry:
+        out("stage 1 done: DDR is up, the boot ROM is back")
+    sleep(STAGE2_PAUSE_S)
+    send(t, UBOOT_ADDR, uboot, timeout, bulk_timeout)
+    flush_cache(t, timeout)
+    prog_start2(t, UBOOT_ADDR, timeout)
     return info
 
 
@@ -453,7 +593,7 @@ def read_file(path):
 
 
 def main(argv=None, out=print, err=None, opener=open_device,
-         closer=close_device):
+         closer=close_device, sleep=None):
     err = err or (lambda s: print(s, file=sys.stderr))
     ap = argparse.ArgumentParser(
         description=__doc__.split("\n")[0],
@@ -477,8 +617,21 @@ def main(argv=None, out=print, err=None, opener=open_device,
                    "spl-usb.bin")
     r.add_argument("--no-flush", action="store_true",
                    help="no FLUSH_CACHE before PROG_START1")
+    u = sub.add_parser("run-uboot", help="Kiln's SPL as stage 1 (DDR only, "
+                       "tagged KILNUSB2), then U-Boot proper to 0x%08x as "
+                       "stage 2: Kiln's U-Boot then offers the eMMC as a USB "
+                       "disk (ums)" % UBOOT_ADDR)
+    u.add_argument("image", help="spl-usb2.bin: spl-mmc.img tagged KILNUSB2")
+    u.add_argument("uboot", help="u-boot.bin (raw, linked at 0x%08x)" %
+                   UBOOT_ADDR)
+    u.add_argument("--stage1-timeout", type=int, default=STAGE1_RETURN_MS,
+                   metavar="MS", help="PROG_START1, until the SPL is back in "
+                   "the boot ROM (default %(default)s)")
     args = ap.parse_args(argv)
-    for name in ("timeout", "bulk_timeout", "cpu_info_length"):
+    names = ["timeout", "bulk_timeout", "cpu_info_length"]
+    if args.cmd == "run-uboot":
+        names.append("stage1_timeout")
+    for name in names:
         if getattr(args, name) <= 0:
             err("ad5x_usbboot: ERROR: --%s must be positive" %
                 name.replace("_", "-"))
@@ -486,9 +639,13 @@ def main(argv=None, out=print, err=None, opener=open_device,
 
     dev = None
     try:
-        img = read_file(args.image) if args.cmd == "run-spl" else None
-        if img is not None:
-            check_image(img)
+        img = uboot = None
+        if args.cmd in ("run-spl", "run-uboot"):
+            img = read_file(args.image)
+            check_image(img, stage2=args.cmd == "run-uboot")
+        if args.cmd == "run-uboot":
+            uboot = read_file(args.uboot)
+            check_uboot(uboot)
         if args.dry_run:
             out("dry run: nothing is sent; the transfers, in order:")
             t = DryRunTransport(out)
@@ -503,6 +660,19 @@ def main(argv=None, out=print, err=None, opener=open_device,
             info = get_cpu_info(t, args.cpu_info_length, args.timeout)
             if not args.dry_run:
                 out("GET_CPU_INFO: %s" % format_cpu_info(info))
+        elif args.cmd == "run-uboot":
+            run_uboot(t, img, uboot, timeout=args.timeout,
+                      bulk_timeout=args.bulk_timeout,
+                      cpu_info_len=args.cpu_info_length,
+                      stage1_timeout=args.stage1_timeout, out=out,
+                      sleep=(lambda s: None) if args.dry_run else sleep)
+            if not args.dry_run:
+                out("started: U-Boot proper, %d bytes at 0x%08x. Kiln's "
+                    "U-Boot offers the eMMC as a USB disk (1d6b:0104, "
+                    "\"Kiln OS\"; lsblk shows it): check it is the "
+                    "printer's before you write to it. Ctrl-C on the "
+                    "console ends it, a power cycle starts from the eMMC "
+                    "again" % (len(uboot), UBOOT_ADDR))
         else:
             run_spl(t, img, flush=not args.no_flush, timeout=args.timeout,
                     bulk_timeout=args.bulk_timeout,
