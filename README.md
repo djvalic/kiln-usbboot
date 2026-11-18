@@ -4,7 +4,7 @@
 AD5X's boot ROM (alexshev86, Windows 10, djvalic/kiln-os#68): the
 descriptors are as expected and GET_CPU_INFO answers `X2600`. `run-spl`
 has not run on a printer yet. `run-uboot` comes from the copy of this tool
-in Kiln OS, where jolting ran it on his AD5X printers
+in Kiln OS, where jolting ran it on their AD5X printers
 ([djvalic/kiln-os#75](https://github.com/djvalic/kiln-os/pull/75)); this
 copy sends the same transfers, but hasn't itself run on a printer yet. The
 protocol was cross-checked against Ingenic's GPL SDK source, Rockbox's
